@@ -4251,7 +4251,7 @@
         (function () {
             const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
             const NUM = {
-                cero:0, uno:1, un:1, dos:2, tres:3, cuatro:4, cinco:5, seis:6, siete:7, ocho:8, nueve:9, diez:10,
+                cero:0, uno:1, dos:2, tres:3, cuatro:4, cinco:5, seis:6, siete:7, ocho:8, nueve:9, diez:10,
                 once:11, doce:12, trece:13, catorce:14, quince:15, dieciseis:16, diecisiete:17, dieciocho:18, diecinueve:19,
                 veinte:20, veintiuno:21, veintiun:21, veintidos:22, veintitres:23, veinticuatro:24, veinticinco:25,
                 veintiseis:26, veintisiete:27, veintiocho:28, veintinueve:29,
@@ -4265,11 +4265,12 @@
                     .replace(/[^a-z0-9ñ ]/g, ' ')
                     .replace(/\s+/g, ' ').trim();
                 // "el 7" / "dorsal el siete" / "numero 14" → números limpios
-                s = s.replace(/\b(dorsal|numero|jugador|el|la)\s+(\d+)\b/g, ' $2 ')
-                     .replace(/\b(\d+)\s*(metros|metro|m)\b/g, '$1m');
+                s = s.replace(/\b(\d+)\s*(metros|metro|m)\b/g, '$1m');
                 const tk = s.split(' '), out = [];
                 for (let i = 0; i < tk.length; i++) {
                     const w = tk[i];
+                    // "el 7", "del 7", "dorsal siete"… → "dorsal 7": así no se confunde con "gol 7" (7 metros)
+                    if (/^(el|del|la|dorsal|numero|jugador)$/.test(w) && tk[i + 1] && (/^\d+$/.test(tk[i + 1]) || tk[i + 1] in NUM)) { out.push('dorsal'); continue; }
                     if (w in NUM) {
                         let v = NUM[w];
                         if (v >= 30 && v % 10 === 0 && tk[i + 1] === 'y' && NUM[tk[i + 2]] >= 1 && NUM[tk[i + 2]] <= 9) {
@@ -4489,6 +4490,30 @@
 
             /* ---------- TTS (feedback por voz) ---------- */
             let ultimaFraseHablada = '';
+            /* Anti-eco: el micrófono oye la voz de confirmación de la app; se ignora lo que se parezca a lo que ella acaba de decir */
+            let hablando = false, finHabla = 0, ctxAudio = null; const hablados = [];
+            const palabrasDe = t => norm(t).split(' ').filter(Boolean);
+            function tono(f, ms) {                    // pitido corto para avisar de un error (no se confunde con palabras)
+                if (!ttsActivo()) return;
+                try {
+                    ctxAudio = ctxAudio || new (window.AudioContext || window.webkitAudioContext)();
+                    const o = ctxAudio.createOscillator(), g = ctxAudio.createGain();
+                    o.frequency.value = f; g.gain.value = 0.07; o.connect(g); g.connect(ctxAudio.destination);
+                    o.start(); o.stop(ctxAudio.currentTime + ms / 1000);
+                } catch (e) {}
+            }
+            function limpiarEco(texto) {              // devuelve el texto sin eco, o '' si todo era eco
+                const ahora = Date.now();
+                if (hablando) return '';
+                const recientes = hablados.filter(h => ahora - h.ts < 7000 && ahora - finHabla < 3500);
+                if (!recientes.length) return texto;
+                const w = palabrasDe(texto); if (!w.length) return '';
+                const oidas = new Set(); recientes.forEach(h => h.w.forEach(x => oidas.add(x)));
+                if (w.every(x => oidas.has(x))) return '';
+                const crudo = texto.trim().split(/\s+/); let n = 0;                 // eco + frase real pegados: se quita el principio repetido
+                while (n < crudo.length && oidas.has(palabrasDe(crudo[n])[0] || '§')) n++;
+                return n >= 2 && n < crudo.length ? crudo.slice(n).join(' ') : texto;
+            }
             function hablar(texto) {
                 if (!ttsActivo() || !window.speechSynthesis) return;
                 try {
@@ -4503,6 +4528,11 @@
                     const es = voces.find(v => v.lang.startsWith('es') && /female|mujer|monica|paulina|helena|sabina/i.test(v.name))
                             || voces.find(v => v.lang.startsWith('es'));
                     if (es) u.voice = es;
+                    hablando = true;
+                    const fin = () => { if (hablando) { hablando = false; finHabla = Date.now(); } };
+                    u.onend = fin; u.onerror = fin;
+                    setTimeout(fin, 900 + String(texto).length * 90);                 // por si el navegador no avisa del final
+                    hablados.push({ w: new Set(palabrasDe(texto)), ts: Date.now() }); if (hablados.length > 6) hablados.shift();
                     window.speechSynthesis.speak(u);
                     ultimaFraseHablada = texto;
                 } catch (e) {}
@@ -4560,14 +4590,16 @@
                     return { cmd: 'golRival', porteria: z.porteria, campo: z.campo, puntos: /triple/.test(s) ? 3 : /libre/.test(s) ? 1 : n ? +n[1] : 2 };
                 }
 
-                let ac = buscarAccion(s), resto = ac ? ac.resto : s, tipoAlias = null;
+                const dmExp = s.match(/\b(?:dorsal|numero|jugador)\s*(\d+)\b/);
+                const sBusq = dmExp ? s.replace(dmExp[0], ' ').replace(/\s+/g, ' ').trim() : s;      // el número del dorsal no cuenta como "6m/7m/9m"
+                let ac = buscarAccion(sBusq), resto = ac ? ac.resto : sBusq, tipoAlias = null;
                 if (!ac) {
                     for (const [tipo, frs] of ALIAS) {
-                        const f = frs.find(x => tiene(s, x));
-                        if (f) { tipoAlias = tipo; resto = (' ' + s + ' ').replace(' ' + f + ' ', ' ').trim(); break; }
+                        const f = frs.find(x => tiene(sBusq, x));
+                        if (f) { tipoAlias = tipo; resto = (' ' + sBusq + ' ').replace(' ' + f + ' ', ' ').trim(); break; }
                     }
                 }
-                const dm = resto.match(/\b(?:dorsal|numero|jugador)\s*(\d+)\b/) || resto.match(/\b(\d+)\b(?!m)/);
+                const dm = dmExp || resto.match(/\b(\d+)\b(?!m)/);
                 const dorsal = dm ? dm[1] : null;
                 const zonas = separarZonas(resto.replace(/\b(dorsal|numero|jugador)\s*\d+\b/, ' '), ac && ac.a.name);
 
@@ -4616,7 +4648,7 @@
             function ejecutar(r) {
                 if (r.error) {
                     aviso('⚠ ' + r.error, false);
-                    hablar('No entendí. ' + r.error);
+                    tono(220, 280);
                     return;
                 }
                 if (r.cmd === 'repite') {
@@ -4778,7 +4810,7 @@
                     return;
                 }
                 aviso('⚠ Comando no reconocido', false);
-                hablar('Comando no reconocido');
+                tono(220, 280);
             }
 
             /* ---------- Interfaz y reconocimiento ---------- */
@@ -4801,21 +4833,24 @@
                 }
                 if (b) {
                     b.style.display = activo ? 'flex' : 'none';
-                    b.querySelector('.est').textContent = escuchando ? '🔴 Escuchando…' : '… reconectando';
+                    b.querySelector('.est').textContent = modoPlantilla ? '📋 Plantilla: di dorsal y nombre (“listo” para terminar)' : (escuchando ? '🔴 Escuchando…' : '… reconectando');
                 }
             }
             function procesar(texto) {
+                texto = limpiarEco(texto);
+                if (!texto) return;                                   // era la propia voz de la app
                 const t = Date.now(), s = norm(texto);
                 if (s === ultimaFrase && t - ultimaT < 2200) return;   // anti-duplicados
                 ultimaFrase = s; ultimaT = t;
                 const b = document.getElementById('voz-barra');
                 if (b) b.querySelector('.oido').textContent = '“' + texto.trim() + '”';
                 try {
+                    if (plantillaVoz(texto)) return;
                     ejecutar(interpretar(texto) || { error: 'No entendí' });
                 } catch (e) {
                     console.error(e);
                     aviso('⚠ Error: ' + e.message, false);
-                    hablar('Error al procesar');
+                    tono(180, 350);
                 }
             }
             function crear() {
@@ -4859,6 +4894,151 @@
                     if (window.speechSynthesis) window.speechSynthesis.cancel();
                 }
                 pintar(activo);
+            }
+
+            /* ---------- PLANTILLA POR VOZ ----------
+               "subir plantilla"  →  "7 Aaron"  "68 Figueroa"  "portero 1 Marcos"  …  "listo"
+               También: "Aaron 7" (nombre y luego dorsal), varios en una frase, "deshacer", "quitar dorsal 7",
+               "plantilla nueva" (vacía la plantilla antes de empezar el partido), "guardar plantilla Mi Equipo". */
+            let modoPlantilla = false, pilaPlantilla = [], pendienteDorsal = null;
+            const baseTok = w => String(w).toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9ñ]/g, '');
+            const esNumTok = b => /^\d+$/.test(b) || (b in NUM);
+            const mayus = w => /[A-ZÁÉÍÓÚÑ]/.test(w.charAt(0)) ? w : w.charAt(0).toUpperCase() + w.slice(1);
+
+            function entradasPlantilla(texto) {
+                const raw = texto.replace(/[,;.:!?]+/g, ' ').split(/\s+/).filter(Boolean);
+                const tk = [];                                     // { num } | { pal, portero }
+                for (let i = 0; i < raw.length; i++) {
+                    const b = baseTok(raw[i]);
+                    if (!b) continue;
+                    if (/^(dorsal|dorsales|numero|jugador|jugadora)$/.test(b)) continue;
+                    if (b === 'el' && raw[i + 1] && esNumTok(baseTok(raw[i + 1]))) continue;
+                    if (esNumTok(b)) {
+                        let v = /^\d+$/.test(b) ? parseInt(b, 10) : NUM[b];
+                        const sig = baseTok(raw[i + 1] || ''), sig2 = baseTok(raw[i + 2] || '');
+                        if (v >= 30 && v % 10 === 0 && sig === 'y' && NUM[sig2] >= 1 && NUM[sig2] <= 9) { v += NUM[sig2]; i += 2; }
+                        tk.push({ num: v });
+                    } else if (/^(portero|portera|porteros)$/.test(b)) tk.push({ portero: true });
+                    else tk.push({ pal: mayus(raw[i]) });
+                }
+                const out = []; let cur = null, portero = false;
+                const cerrar = () => { if (cur) { out.push(cur); cur = null; } };
+                const primero = tk.find(t => t.num !== undefined || t.pal);
+                const dorsalPrimero = pendienteInicial !== null || (primero && primero.num !== undefined);
+                if (dorsalPrimero) {                             // "7 Aaron 68 Figueroa"
+                    tk.forEach(t => {
+                        if (t.portero) { portero = true; return; }
+                        if (t.num !== undefined) { cerrar(); cur = { num: t.num, nombre: [], portero }; portero = false; }
+                        else { if (!cur && pendienteInicial !== null) { cur = { num: pendienteInicial, nombre: [], portero: false }; pendienteInicial = null; } if (cur) cur.nombre.push(t.pal); }
+                    });
+                    cerrar();
+                } else {                                         // "Aaron 7 Figueroa 68"
+                    let nom = [];
+                    tk.forEach(t => {
+                        if (t.portero) { portero = true; return; }
+                        if (t.num !== undefined) { out.push({ num: t.num, nombre: nom, portero }); nom = []; portero = false; }
+                        else nom.push(t.pal);
+                    });
+                    if (nom.length) out.push({ num: null, nombre: nom, portero: false });
+                }
+                return out;
+            }
+            let pendienteInicial = null;
+
+            function altaJugadorVoz(e) {
+                const dorsal = parsearDorsal(String(e.num));
+                if (dorsal === null) return { ok: false, txt: `dorsal ${e.num} no válido` };
+                const nombre = e.nombre.length ? e.nombre.join(' ') : `Jugador #${dorsal}`;
+                const pos = e.portero ? posiciones.find(x => /port/i.test(x.n)) : null;
+                let p = players.find(x => !x.inactivo && x.number === dorsal), txt;
+                if (p) {
+                    const antes = { name: p.name, posicion: p.posicion };
+                    p.name = nombre; if (pos) p.posicion = pos.n;
+                    pilaPlantilla.push(() => { p.name = antes.name; p.posicion = antes.posicion; });
+                    txt = `#${dorsal} ${nombre}${pos ? ' (portero)' : ''} (actualizado)`;
+                } else {
+                    let id = Date.now(); while (players.some(x => x.id === id)) id++;
+                    const entraEnPista = !partidoEnMarcha() && players.filter(x => x.onField && !x.inactivo && !x.oculto).length < 7;
+                    const np = { id, number: dorsal, name: nombre, posicion: pos ? pos.n : '', onField: entraEnPista, totalSeconds: 0, attacksCount: 0, exclusionSeconds: 0 };
+                    players.push(np);
+                    pilaPlantilla.push(() => { players = players.filter(x => x.id !== np.id); });
+                    txt = `#${dorsal} ${nombre}${pos ? ' (portero)' : ''}`;
+                }
+                return { ok: true, txt, voz: `${dorsal}, ${nombre}` };
+            }
+
+            function plantillaVoz(texto) {
+                const s = norm(texto);
+                const bajo = texto.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9ñ ]/g, ' ').replace(/\s+/g, ' ').trim();
+                // guardar plantilla con nombre
+                const g = bajo.match(/^guardar (?:la |esta )?(?:plantilla|equipo)(?: como| con nombre| llamada| llamado)? (.+)$/);
+                if (g) {
+                    const nombre = texto.trim().split(/\s+/).slice(texto.trim().split(/\s+/).length - g[1].split(' ').length).map(mayus).join(' ');
+                    const pr = window.prompt, cf = window.confirm, al = window.alert;
+                    window.prompt = () => nombre; window.confirm = () => true; window.alert = m => mostrarToastRapido(escaparHTML(String(m)), 3000);
+                    try { guardarPlantillaActual(); } finally { window.prompt = pr; window.confirm = cf; window.alert = al; }
+                    aviso(`💾 Plantilla guardada: ${nombre}`, true); hablar('Plantilla guardada como ' + nombre);
+                    return true;
+                }
+                // entrar en modo plantilla
+                const ini = bajo.match(/^(?:subir|subo|cargar|carga|crear|crea|anadir|anade|meter|introducir|dictar|nueva|empezar|empieza|abrir|abre)?\s*(?:la |una |mi )?plantilla(?: nueva)?\b\s*(.*)$/);
+                if (!modoPlantilla && ini && !/^(guardar)/.test(bajo)) {
+                    const nueva = /\b(nueva|borrar|vaciar|desde cero)\b/.test(bajo);
+                    modoPlantilla = true; pilaPlantilla = []; pendienteDorsal = null; pendienteInicial = null;
+                    let msg = '📋 Modo plantilla: di “7 Aaron”, “68 Figueroa”… y “listo” para terminar';
+                    if (nueva) {
+                        if (partidoEnMarcha()) msg += ' (no se vació: el partido ya ha empezado)';
+                        else { const antes = players; players = []; pilaPlantilla.push(() => { players = antes; }); renderRoster(); msg = '📋 Plantilla vaciada. ' + msg.slice(3); }
+                    }
+                    aviso(msg, true); pintar(true); hablar(nueva ? 'Plantilla nueva. Dime dorsal y nombre.' : 'Modo plantilla. Dime dorsal y nombre.');
+                    const resto = texto.trim().split(/\s+/).slice(-((ini[1] || '').split(' ').filter(Boolean).length)).join(' ');
+                    return ini[1] ? (plantillaVoz(resto) || true) : true;
+                }
+                if (!modoPlantilla) return false;
+                if (!bajo) return true;
+
+                // salir
+                if (/^(listo|ya esta|ya|fin|final|terminar|termina|terminado|acabar|acaba|salir|sal|cerrar|cierra|nada mas|eso es todo|(fin|final|terminar|termina|cerrar|cierra|acabar) (de )?(la )?plantilla|plantilla (terminada|lista|completa))$/.test(bajo)) {
+                    modoPlantilla = false; pendienteDorsal = null; pendienteInicial = null; pintar(true);
+                    renderRoster(); try { guardarConfigLocalYa(); } catch (e) {}
+                    const n = players.filter(x => !x.inactivo).length;
+                    aviso(`✓ Plantilla lista: ${n} jugadores`, true); hablar(`Plantilla lista. ${n} jugadores.`);
+                    return true;
+                }
+                // deshacer lo último
+                if (/^(deshacer|deshaz|atras|borra|borrar|anula|anular|quita|quitar|borra el ultimo|borrar ultimo|quita el ultimo|quitar ultimo)$/.test(bajo)) {
+                    const f = pilaPlantilla.pop();
+                    if (!f) { aviso('Nada que deshacer', false); return true; }
+                    f(); renderRoster(); guardarConfigLocal(); aviso('↩ Deshecho', true); hablar('Deshecho');
+                    return true;
+                }
+                // quitar un dorsal
+                const q = bajo.match(/^(?:eliminar|elimina|quitar|quita|borrar|borra)\s+(?:al\s+)?(?:dorsal\s+)?(\w+)$/);
+                if (q) {
+                    const b = q[1], d = /^\d+$/.test(b) ? parseInt(b, 10) : NUM[b];
+                    const p = d !== undefined ? players.find(x => !x.inactivo && x.number === d) : null;
+                    if (!p) { aviso(`⚠ No encuentro el dorsal ${q[1]}`, false); return true; }
+                    if (partidoEnMarcha()) { aviso('⚠ El partido ya ha empezado: quítalo con la × de la plantilla', false); return true; }
+                    const antes = players;
+                    players = players.filter(x => x.id !== p.id); pilaPlantilla.push(() => { players = antes; });
+                    renderRoster(); guardarConfigLocal(); aviso(`🗑 Quitado #${p.number} ${p.name}`, true); hablar(`Quitado ${p.number}`);
+                    return true;
+                }
+                // jugadores
+                pendienteInicial = pendienteDorsal; pendienteDorsal = null;
+                const lista = entradasPlantilla(texto);
+                const hechos = [], avisos = [], voz = [];
+                lista.forEach(e => {
+                    if (e.num === null) { avisos.push(`“${e.nombre.join(' ')}” sin dorsal`); return; }
+                    if (!e.nombre.length && !e.portero && lista[lista.length - 1] === e) { pendienteDorsal = e.num; hechos.push(`#${e.num}…`); return; }
+                    const r = altaJugadorVoz(e);
+                    if (r.ok) { hechos.push(r.txt); voz.push(r.voz); } else avisos.push(r.txt);
+                });
+                if (!hechos.length && !avisos.length) { aviso('⚠ No entendí: di dorsal y nombre, por ejemplo “7 Aaron”', false); return true; }
+                renderRoster(); guardarConfigLocal();
+                aviso((hechos.length ? '✓ ' + hechos.join(' · ') : '') + (avisos.length ? ' ⚠ ' + avisos.join(' · ') : ''), !avisos.length);
+                if (voz.length) hablar(voz.join('. '));
+                return true;
             }
 
             // Exponer para depuración
